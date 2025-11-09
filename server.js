@@ -1,5 +1,5 @@
 import http from "node:http";
-import { startP2P } from "./p2p.js";
+// import { startP2P } from "./p2p.js";
 
 const PORT = Number(process.env.PORT || 7070);
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
