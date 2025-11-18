@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@xenova/transformers": "^2.16.1",
     "@libp2p/pubsub": "^10.1.18",
     "express": "^5.1.0",
     "ipfs-core": "^0.18.1",
