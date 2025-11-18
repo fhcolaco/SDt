@@ -5,7 +5,7 @@ const PORT = Number(process.env.PORT || 7070);
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 
 const isLeader = process.argv.includes("--leader");
-const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || "mestres-broadcast";
+const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
 const documentVectors = [];
 let embeddingsPipelinePromise = null;
 
@@ -105,20 +105,27 @@ function createDocumentVectorVersion(cid, metadata = {}) {
 async function publishToTopic(message) {
   const payload =
     typeof message === "string" ? message : JSON.stringify(message);
+
   const form = new FormData();
-  form.append("data", payload);
+  form.append(
+    "file",
+    new Blob([payload], { type: "application/octet-stream" })
+  );
 
-  const url = new URL(`${IPFS_BASE}/api/v0/pubsub/pub`);
-  url.searchParams.set("arg", encodeTopic(PUBSUB_TOPIC));
+  const resp = await fetch(
+    `${IPFS_BASE}/api/v0/pubsub/pub?arg=${encodeTopic(PUBSUB_TOPIC)}`,
+    {
+      method: "POST",
+      body: form,
+    }
+  );
 
-  const resp = await fetch(url, {
-    method: "POST",
-    body: form,
-  });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     throw new Error(`Falha IPFS pubsub pub: HTTP ${resp.status} ${body}`);
   }
+
+  return payload;
 }
 
 async function handleUpload(req, res) {
@@ -240,11 +247,11 @@ async function handleBroadcast(req, res) {
     }
     if (!msg) return sendJson(res, 400, { error: "Mensagem vazia." });
 
-    await publishToTopic(msg);
+    const x = await publishToTopic(msg);
     return sendJson(res, 200, {
       ok: true,
       topic: PUBSUB_TOPIC,
-      published: msg,
+      published: x.toString(),
     });
   } catch (e) {
     return sendJson(res, 500, {
