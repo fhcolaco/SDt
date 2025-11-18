@@ -1,18 +1,13 @@
 import http from "node:http";
-// import { startP2P } from "./p2p.js";
+import { pipeline } from "@xenova/transformers";
 
 const PORT = Number(process.env.PORT || 7070);
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 
 const isLeader = process.argv.includes("--leader");
-const p2pPortArg = process.argv
-  .find((a) => a.startsWith("--p2p-port="))
-  ?.split("=")[1];
-const connectArg = process.argv
-  .find((a) => a.startsWith("--connect="))
-  ?.split("=")[1];
-const p2pPort = p2pPortArg ? parseInt(p2pPortArg, 10) : 15000;
-let p2p = null;
+const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || "mestres-broadcast";
+const documentVectors = [];
+let embeddingsPipelinePromise = null;
 
 function sendJson(res, status, obj) {
   const data = Buffer.from(JSON.stringify(obj));
@@ -37,12 +32,72 @@ async function ipfsAlive() {
   }
 }
 
-if (isLeader) {
-  p2p = await startP2P({ p2pPort, connect: connectArg }); // líder também pode “dial” peers, se precisares
-  console.log("P2P do Líder:");
-  console.log("peerId:", p2p.peerId);
-  console.log("addrs :", p2p.addrs.join(" | "));
-  console.log("topic :", p2p.topic);
+async function getEmbeddingPipeline() {
+  if (!embeddingsPipelinePromise) {
+    embeddingsPipelinePromise = pipeline(
+      "feature-extraction",
+      "sentence-transformers/all-MiniLM-L6-v2"
+    );
+  }
+  return embeddingsPipelinePromise;
+}
+
+function bufferToEmbeddableText(buffer) {
+  const asText = buffer.toString("utf8");
+  const controlMatches = asText.match(/[\x00-\x08\x0E-\x1F]/g) ?? [];
+  if (controlMatches.length > asText.length * 0.1) {
+    return buffer.toString("base64");
+  }
+  return asText;
+}
+
+function fallbackEmbeddings(buffer, dimension = 64) {
+  const acc = new Array(dimension).fill(0);
+  for (let i = 0; i < buffer.length; i += 1) {
+    acc[i % dimension] += buffer[i];
+  }
+  const norm = Math.sqrt(acc.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return acc.map((value) => value / norm);
+}
+
+async function generateEmbeddings(buffer) {
+  const text = bufferToEmbeddableText(buffer);
+  try {
+    const embedder = await getEmbeddingPipeline();
+    const output = await embedder(text, { pooling: "mean", normalize: true });
+    return Array.from(output.data);
+  } catch (error) {
+    console.error("Falha ao gerar embeddings com transformer, usando fallback:", error);
+    return fallbackEmbeddings(buffer);
+  }
+}
+
+function createDocumentVectorVersion(cid, metadata = {}) {
+  const lastVersion = documentVectors.at(-1);
+  const vector = [...(lastVersion?.cids ?? [])];
+  vector.push(cid);
+  const version = lastVersion ? lastVersion.version + 1 : 1;
+  const entry = {
+    version,
+    cids: vector,
+    confirmed: false,
+    metadata,
+    createdAt: new Date().toISOString(),
+  };
+  documentVectors.push(entry);
+  return entry;
+}
+
+async function publishToTopic(message) {
+  const url = new URL(`${IPFS_BASE}/api/v0/pubsub/pub`);
+  url.searchParams.set("arg", PUBSUB_TOPIC);
+  url.searchParams.set("arg", typeof message === "string" ? message : JSON.stringify(message));
+
+  const resp = await fetch(url, { method: "POST" });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Falha IPFS pubsub pub: HTTP ${resp.status} ${body}`);
+  }
 }
 
 async function handleUpload(req, res) {
@@ -78,11 +133,51 @@ async function handleUpload(req, res) {
       });
     }
     const json = await ipfsResp.json();
+    const cid = json?.Hash ?? null;
+    if (!cid) {
+      return sendJson(res, 502, {
+        error: "Resposta IPFS inválida",
+      });
+    }
+
+    const versionEntry = createDocumentVectorVersion(cid, {
+      filename: String(filename),
+      size: json?.Size ? Number(json.Size) : buffer.length,
+    });
+    const embeddings = await generateEmbeddings(buffer);
+    const payload = {
+      type: "document-update",
+      vectorVersion: versionEntry.version,
+      vector: versionEntry.cids,
+      document: {
+        cid,
+        filename: String(filename),
+        size: versionEntry.metadata.size,
+      },
+      embeddings,
+      createdAt: versionEntry.createdAt,
+    };
+
+    let propagation = { ok: false, error: "Líder não configurado" };
+    if (isLeader) {
+      try {
+        await publishToTopic(payload);
+        propagation = { ok: true };
+      } catch (error) {
+        console.error("Erro ao propagar atualização para os peers:", error);
+        propagation = { ok: false, error: String(error?.message || error) };
+      }
+    }
+
     return sendJson(res, 201, {
       name: json?.Name ?? String(filename),
-      cid: json?.Hash ?? null,
-      size: json?.Size ? Number(json.Size) : buffer.length,
+      cid,
+      size: versionEntry.metadata.size,
       pinned: true,
+      vectorVersion: versionEntry.version,
+      currentVector: versionEntry.cids,
+      embeddingsDimensions: embeddings.length,
+      propagation,
     });
   } catch (e) {
     return sendJson(res, 500, {
@@ -98,13 +193,12 @@ async function handleHealth(_req, res) {
     status: "ok",
     ipfs: alive ? "up" : "down",
   };
-  if (isLeader && p2p) {
-    body.p2p = {
-      topic: p2p.topic,
-      peerId: p2p.peerId,
-      addrs: p2p.addrs,
-    };
-  }
+  body.pubsub = { topic: PUBSUB_TOPIC };
+  body.vector = {
+    latestVersion: documentVectors.at(-1)?.version ?? null,
+    totalVersions: documentVectors.length,
+    latestSize: documentVectors.at(-1)?.cids.length ?? 0,
+  };
   return sendJson(res, 200, body);
 }
 
@@ -125,21 +219,8 @@ async function handleBroadcast(req, res) {
     }
     if (!msg) return sendJson(res, 400, { error: "Mensagem vazia." });
 
-    const TOPIC = process.env.PUBSUB_TOPIC || "mestres-broadcast";
-    const url = new URL(`${IPFS_BASE}/api/v0/pubsub/pub`);
-    url.searchParams.set("arg", TOPIC);
-    url.searchParams.set("arg", msg);
-
-    const r = await fetch(url, { method: "POST" });
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      return sendJson(res, 502, {
-        error: "Falha IPFS pubsub pub",
-        detail: `HTTP ${r.status}`,
-        body: t.slice(0, 500),
-      });
-    }
-    return sendJson(res, 200, { ok: true, topic: TOPIC, published: msg });
+    await publishToTopic(msg);
+    return sendJson(res, 200, { ok: true, topic: PUBSUB_TOPIC, published: msg });
   } catch (e) {
     return sendJson(res, 500, {
       error: "Erro no broadcast",
@@ -165,7 +246,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(
-    `Leader API em http://localhost:${PORT} ${isLeader ? "(líder + P2P)" : ""}`
-  );
+  console.log(`Leader API em http://localhost:${PORT} ${isLeader ? "(líder)" : ""}`);
+  if (isLeader) {
+    console.log(`Propagação via pubsub tópico "${PUBSUB_TOPIC}"`);
+  }
 });

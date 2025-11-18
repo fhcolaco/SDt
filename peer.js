@@ -15,6 +15,12 @@ if (!resp.ok) {
 const reader = resp.body.getReader();
 const decoder = new TextDecoder();
 let buf = "";
+function summarizeEmbeddings(embeddings) {
+  if (!Array.isArray(embeddings) || embeddings.length === 0) return null;
+  const preview = embeddings.slice(0, 5).map((n) => Number(n.toFixed(4)));
+  return { dimension: embeddings.length, preview };
+}
+
 while (true) {
   const { value, done } = await reader.read();
   if (done) break;
@@ -27,6 +33,18 @@ while (true) {
     try {
       const obj = JSON.parse(line); // NDJSON com { from, data }
       const msg = Buffer.from(obj.data, "base64").toString("utf8");
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed?.type === "document-update") {
+          const info = summarizeEmbeddings(parsed.embeddings);
+          console.log(
+            `📩 [${TOPIC}] versão ${parsed.vectorVersion} com ${parsed.vector?.length ?? 0} CIDs. CID do documento: ${parsed.document?.cid}. Embeddings: ${info?.dimension ?? 0} dimensões${
+              info ? ` (preview ${info.preview.join(", ")})` : ""
+            }.`
+          );
+          continue;
+        }
+      } catch {}
       console.log(`📩 [${TOPIC}] ${obj.from}: ${msg}`);
     } catch {}
   }
