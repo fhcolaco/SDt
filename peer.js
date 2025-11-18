@@ -1,8 +1,15 @@
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 const TOPIC = process.env.PUBSUB_TOPIC || "mestres-broadcast";
 
+function encodeTopic(topic) {
+  const txt = String(topic ?? "");
+  const base64 = Buffer.from(txt, "utf8").toString("base64");
+  const urlSafe = base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `u${urlSafe}`;
+}
+
 const subUrl = new URL(`${IPFS_BASE}/api/v0/pubsub/sub`);
-subUrl.searchParams.set("arg", TOPIC);
+subUrl.searchParams.set("arg", encodeTopic(TOPIC));
 
 console.log(`[peer] subscrever "${TOPIC}" em ${IPFS_BASE}`);
 const resp = await fetch(subUrl, { method: "POST" });

@@ -9,6 +9,13 @@ const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || "mestres-broadcast";
 const documentVectors = [];
 let embeddingsPipelinePromise = null;
 
+function encodeTopic(topic) {
+  const txt = String(topic ?? "");
+  const base64 = Buffer.from(txt, "utf8").toString("base64");
+  const urlSafe = base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `u${urlSafe}`;
+}
+
 function sendJson(res, status, obj) {
   const data = Buffer.from(JSON.stringify(obj));
   res.writeHead(status, {
@@ -90,8 +97,8 @@ function createDocumentVectorVersion(cid, metadata = {}) {
 
 async function publishToTopic(message) {
   const url = new URL(`${IPFS_BASE}/api/v0/pubsub/pub`);
-  url.searchParams.set("arg", PUBSUB_TOPIC);
-  url.searchParams.set("arg", typeof message === "string" ? message : JSON.stringify(message));
+  url.searchParams.append("arg", encodeTopic(PUBSUB_TOPIC));
+  url.searchParams.append("arg", typeof message === "string" ? message : JSON.stringify(message));
 
   const resp = await fetch(url, { method: "POST" });
   if (!resp.ok) {
