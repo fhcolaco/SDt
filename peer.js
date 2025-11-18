@@ -1,5 +1,5 @@
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
-const TOPIC = process.env.PUBSUB_TOPIC || "mestres-broadcast";
+const TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
 
 function encodeTopic(topic) {
   const txt = String(topic ?? "");
@@ -38,21 +38,24 @@ while (true) {
     buf = buf.slice(i + 1);
     if (!line) continue;
     try {
-      const obj = JSON.parse(line); // NDJSON com { from, data }
-      const msg = Buffer.from(obj.data, "base64").toString("utf8");
+      const obj = JSON.parse(line);
+      let encoded = obj.data;
+      if (typeof encoded === "string" && encoded.startsWith("u")) {
+        encoded = encoded.slice(1); // remove o 'u'
+      }
+      const msg = Buffer.from(encoded, "base64").toString("utf8");
       try {
         const parsed = JSON.parse(msg);
         if (parsed?.type === "document-update") {
           const info = summarizeEmbeddings(parsed.embeddings);
           console.log(
-            `📩 [${TOPIC}] versão ${parsed.vectorVersion} com ${parsed.vector?.length ?? 0} CIDs. CID do documento: ${parsed.document?.cid}. Embeddings: ${info?.dimension ?? 0} dimensões${
-              info ? ` (preview ${info.preview.join(", ")})` : ""
+            `📩 [${TOPIC}] versão ${parsed.vectorVersion} com ${parsed.vector?.length ?? 0} CIDs. CID do documento: ${parsed.document?.cid}. Embeddings: ${info?.dimension ?? 0} dimensões${info ? ` (preview ${info.preview.join(", ")})` : ""
             }.`
           );
           continue;
         }
-      } catch {}
+      } catch { }
       console.log(`📩 [${TOPIC}] ${obj.from}: ${msg}`);
-    } catch {}
+    } catch { console.error("Falha ao processar mensagem:", line); }
   }
 }
