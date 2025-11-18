@@ -12,7 +12,10 @@ let embeddingsPipelinePromise = null;
 function encodeTopic(topic) {
   const txt = String(topic ?? "");
   const base64 = Buffer.from(txt, "utf8").toString("base64");
-  const urlSafe = base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const urlSafe = base64
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
   return `u${urlSafe}`;
 }
 
@@ -63,7 +66,8 @@ function fallbackEmbeddings(buffer, dimension = 64) {
   for (let i = 0; i < buffer.length; i += 1) {
     acc[i % dimension] += buffer[i];
   }
-  const norm = Math.sqrt(acc.reduce((sum, value) => sum + value * value, 0)) || 1;
+  const norm =
+    Math.sqrt(acc.reduce((sum, value) => sum + value * value, 0)) || 1;
   return acc.map((value) => value / norm);
 }
 
@@ -74,7 +78,10 @@ async function generateEmbeddings(buffer) {
     const output = await embedder(text, { pooling: "mean", normalize: true });
     return Array.from(output.data);
   } catch (error) {
-    console.error("Falha ao gerar embeddings com transformer, usando fallback:", error);
+    console.error(
+      "Falha ao gerar embeddings com transformer, usando fallback:",
+      error
+    );
     return fallbackEmbeddings(buffer);
   }
 }
@@ -96,11 +103,18 @@ function createDocumentVectorVersion(cid, metadata = {}) {
 }
 
 async function publishToTopic(message) {
-  const url = new URL(`${IPFS_BASE}/api/v0/pubsub/pub`);
-  url.searchParams.append("arg", encodeTopic(PUBSUB_TOPIC));
-  url.searchParams.append("arg", typeof message === "string" ? message : JSON.stringify(message));
+  const payload =
+    typeof message === "string" ? message : JSON.stringify(message);
+  const form = new FormData();
+  form.append("data", payload);
 
-  const resp = await fetch(url, { method: "POST" });
+  const url = new URL(`${IPFS_BASE}/api/v0/pubsub/pub`);
+  url.searchParams.set("arg", encodeTopic(PUBSUB_TOPIC));
+
+  const resp = await fetch(url, {
+    method: "POST",
+    body: form,
+  });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     throw new Error(`Falha IPFS pubsub pub: HTTP ${resp.status} ${body}`);
@@ -227,7 +241,11 @@ async function handleBroadcast(req, res) {
     if (!msg) return sendJson(res, 400, { error: "Mensagem vazia." });
 
     await publishToTopic(msg);
-    return sendJson(res, 200, { ok: true, topic: PUBSUB_TOPIC, published: msg });
+    return sendJson(res, 200, {
+      ok: true,
+      topic: PUBSUB_TOPIC,
+      published: msg,
+    });
   } catch (e) {
     return sendJson(res, 500, {
       error: "Erro no broadcast",
@@ -253,7 +271,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Leader API em http://localhost:${PORT} ${isLeader ? "(líder)" : ""}`);
+  console.log(
+    `Leader API em http://localhost:${PORT} ${isLeader ? "(líder)" : ""}`
+  );
   if (isLeader) {
     console.log(`Propagação via pubsub tópico "${PUBSUB_TOPIC}"`);
   }
