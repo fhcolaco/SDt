@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { pipeline } from "@xenova/transformers";
 
 const PORT = Number(process.env.PORT || 7070);
@@ -7,6 +8,7 @@ const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 const isLeader = process.argv.includes("--leader");
 const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
 const documentVectors = [];
+const confirmationLog = new Map();
 let embeddingsPipelinePromise = null;
 
 function encodeTopic(topic) {
@@ -17,6 +19,14 @@ function encodeTopic(topic) {
     .replace(/\//g, "_")
     .replace(/=+$/, "");
   return `u${urlSafe}`;
+}
+
+function hashVector(cids = []) {
+  const h = createHash("sha256");
+  for (const cid of cids) {
+    h.update(String(cid));
+  }
+  return h.digest("hex");
 }
 
 function sendJson(res, status, obj) {
@@ -128,15 +138,109 @@ async function publishToTopic(message) {
   return payload;
 }
 
+function recordVectorConfirmation(message, sender) {
+  const version = Number(message?.vectorVersion ?? 0);
+  const hash = message?.vectorHash ? String(message.vectorHash) : null;
+  const from = message?.peerId || sender || "peer";
+  const vectorLength = message?.vectorLength ?? null;
+
+  const expected = documentVectors.find((v) => v.version === version);
+  const expectedHash = expected ? hashVector(expected.cids) : null;
+  const matches = expectedHash && hash ? expectedHash === hash : null;
+
+  const entry = confirmationLog.get(version) ?? {
+    confirmations: [],
+    expectedHash,
+  };
+  entry.expectedHash = expectedHash ?? entry.expectedHash ?? null;
+  entry.confirmations.push({
+    peerId: from,
+    hash,
+    vectorLength,
+    matches,
+    receivedAt: new Date().toISOString(),
+  });
+  confirmationLog.set(version, entry);
+
+  console.log(
+    `[leader] confirmacao recebida da versao ${version} de ${from}:` +
+      ` hash ${hash ?? "n/a"}` +
+      `${matches === false ? " (mismatch)" : ""}` +
+      `${matches === null ? " (sem hash esperado)" : ""}`
+  );
+}
+
+async function startLeaderConfirmationListener() {
+  const subUrl = new URL(`${IPFS_BASE}/api/v0/pubsub/sub`);
+  subUrl.searchParams.set("arg", encodeTopic(PUBSUB_TOPIC));
+  console.log(
+    `[leader] ouvindo confirmacoes no topico "${PUBSUB_TOPIC}" via pubsub...`
+  );
+
+  try {
+    const resp = await fetch(subUrl, { method: "POST" });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      console.error(
+        "Falha ao subscrever o topico de confirmacoes:",
+        resp.status,
+        txt
+      );
+      return;
+    }
+
+    const reader = resp.body?.getReader?.();
+    if (!reader) {
+      console.error("Subscricao de pubsub sem reader disponivel.");
+      return;
+    }
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line);
+          let encoded = obj.data;
+          if (typeof encoded === "string" && encoded.startsWith("u")) {
+            encoded = encoded.slice(1);
+          }
+          const msg = Buffer.from(encoded, "base64").toString("utf8");
+          let parsed;
+          try {
+            parsed = JSON.parse(msg);
+          } catch {
+            parsed = null;
+          }
+          if (parsed?.type === "vector-confirmation") {
+            recordVectorConfirmation(parsed, obj.from);
+          }
+        } catch (err) {
+          console.error("Falha ao processar mensagem do pubsub:", err);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Erro ao escutar confirmacoes via pubsub:", err);
+  }
+}
+
 async function handleUpload(req, res) {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
     return res.end();
   }
-  const filename = req.headers["x-filename"];
+  const filename = req.headers["filename"];
   if (!filename || String(filename).trim() === "") {
     return sendJson(res, 400, {
-      error: "Cabeçalho 'X-Filename' é obrigatório.",
+      error: "Cabeçalho 'Filename' é obrigatório.",
     });
   }
   try {
@@ -263,10 +367,11 @@ async function handleBroadcast(req, res) {
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.url === "/health" && req.method === "GET")
+    const { pathname } = new URL(req.url, "http://localhost");
+    if (pathname === "/health" && req.method === "GET")
       return handleHealth(req, res);
-    if (req.url === "/files") return handleUpload(req, res);
-    if (req.url === "/broadcast") return handleBroadcast(req, res);
+    if (pathname === "/files") return handleUpload(req, res); // aceita /files e /files/
+    if (pathname === "/broadcast") return handleBroadcast(req, res);
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("Not Found");
   } catch (e) {
@@ -276,6 +381,12 @@ const server = http.createServer(async (req, res) => {
     });
   }
 });
+
+if (isLeader) {
+  startLeaderConfirmationListener().catch((err) =>
+    console.error("Erro ao iniciar listener de confirmacoes:", err)
+  );
+}
 
 server.listen(PORT, () => {
   console.log(
