@@ -4,6 +4,12 @@ import { hostname } from "node:os";
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 const TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
 const PEER_ID = process.env.PEER_ID || hostname();
+const HEARTBEAT_TIMEOUT_MS = Number(
+  process.env.PEER_HEARTBEAT_TIMEOUT_MS || 15000
+);
+const HEARTBEAT_CHECK_MS = Number(
+  process.env.PEER_HEARTBEAT_CHECK_MS || 2000
+);
 
 function encodeTopic(topic) {
   const txt = String(topic ?? "");
@@ -43,12 +49,16 @@ if (!reader) {
   process.exit(1);
 }
 
+startHeartbeatMonitor();
+
 const decoder = new TextDecoder();
 let buf = "";
 
 const vectorVersions = [];
 const pendingEmbeddings = new Map();
 const faissIndex = new Map(); // simulacao em memoria
+let lastHeartbeatAt = Date.now();
+let leaderAlive = true;
 
 function hashVector(cids = []) {
   const h = createHash("sha256");
@@ -130,6 +140,7 @@ async function sendConfirmation(entry, vectorHash) {
 }
 
 async function handleDocumentUpdate(payload, sender) {
+  touchHeartbeat(sender ?? "leader");
   const result = storeIncomingVersion(payload, sender);
   if (result.status === "conflict") {
     console.warn(
@@ -147,7 +158,16 @@ async function handleDocumentUpdate(payload, sender) {
   }
 }
 
+async function handleLeaderBlock(payload, sender) {
+  touchHeartbeat(payload?.leaderId ?? sender ?? "leader");
+  const updates = Array.isArray(payload?.updates) ? payload.updates : [];
+  for (const update of updates) {
+    await handleDocumentUpdate(update, payload?.leaderId ?? sender);
+  }
+}
+
 function applyCommit(payload, sender) {
+  touchHeartbeat(payload?.leaderId ?? sender ?? "leader");
   const version = Number(payload?.vectorVersion ?? 0);
   const vectorHash = payload?.vectorHash ? String(payload.vectorHash) : null;
   const entry = vectorVersions.find((v) => v.version === version);
@@ -176,6 +196,26 @@ function logConfirmation(message, sender) {
     `[peer] confirmacao recebida de ${from} para versao ${message?.vectorVersion ?? "?"}` +
     `${message?.vectorHash ? ` (hash ${String(message.vectorHash).slice(0, 8)}...)` : ""}`
   );
+}
+
+function touchHeartbeat(source = "leader") {
+  lastHeartbeatAt = Date.now();
+  if (!leaderAlive) {
+    leaderAlive = true;
+    console.log(`[peer] heartbeat retomado do ${source}.`);
+  }
+}
+
+function startHeartbeatMonitor() {
+  setInterval(() => {
+    const delta = Date.now() - lastHeartbeatAt;
+    if (leaderAlive && delta > HEARTBEAT_TIMEOUT_MS) {
+      leaderAlive = false;
+      console.warn(
+        `[peer] possivel falha do lider: ${Math.round(delta / 1000)}s sem heartbeat.`
+      );
+    }
+  }, HEARTBEAT_CHECK_MS);
 }
 
 while (true) {
@@ -210,6 +250,14 @@ while (true) {
       }
       if (parsed?.type === "vector-commit") {
         applyCommit(parsed, obj.from);
+        continue;
+      }
+      if (parsed?.type === "leader-block") {
+        await handleLeaderBlock(parsed, obj.from);
+        continue;
+      }
+      if (parsed?.type === "leader-heartbeat") {
+        touchHeartbeat(parsed?.leaderId ?? obj.from ?? "leader");
         continue;
       }
       console.log(`[peer] [${TOPIC}] ${obj.from ?? "unknown"}: ${msg}`);

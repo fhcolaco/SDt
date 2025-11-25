@@ -1,5 +1,6 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { hostname } from "node:os";
 import { pipeline } from "@xenova/transformers";
 
 const PORT = Number(process.env.PORT || 7070);
@@ -11,6 +12,15 @@ const documentVectors = [];
 const confirmationLog = new Map();
 const peerCountHint = Number(process.env.PEER_COUNT_HINT || 0);
 const peerQuorumOverride = Number(process.env.PEER_QUORUM || 0);
+const leaderId = process.env.LEADER_ID || hostname();
+
+const HEARTBEAT_INTERVAL_MS = Number(
+  process.env.LEADER_HEARTBEAT_INTERVAL_MS || 5000
+);
+const BLOCK_FLUSH_MS = HEARTBEAT_INTERVAL_MS;
+
+const pendingLeaderUpdates = [];
+let heartbeatTimer = null;
 let embeddingsPipelinePromise = null;
 
 function encodeTopic(topic) {
@@ -98,6 +108,36 @@ async function generateEmbeddings(buffer) {
   }
 }
 
+async function flushLeaderBlock(reason = "heartbeat") {
+  const updates = pendingLeaderUpdates.splice(0);
+  const latest = documentVectors.at(-1);
+  const payload = {
+    type: "leader-block",
+    leaderId,
+    sentAt: new Date().toISOString(),
+    reason,
+    latestVersion: latest?.version ?? 0,
+    latestHash: latest ? hashVector(latest.cids) : null,
+    updates,
+  };
+  try {
+    await publishToTopic(payload);
+    const updateCount = updates.length;
+    const label = updateCount > 0 ? `${updateCount} update(s)` : "heartbeat";
+    console.log(`[leader] bloco enviado (${label})`);
+  } catch (err) {
+    console.error("Falha ao enviar bloco/heartbeat do lider:", err);
+  }
+}
+
+function startLeaderHeartbeat() {
+  if (!isLeader) return;
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    flushLeaderBlock("interval");
+  }, BLOCK_FLUSH_MS);
+}
+
 function createDocumentVectorVersion(cid, metadata = {}) {
   const lastVersion = documentVectors.at(-1);
   const vector = [...(lastVersion?.cids ?? [])];
@@ -138,6 +178,10 @@ async function publishToTopic(message) {
   }
 
   return payload;
+}
+
+function queueLeaderUpdate(updatePayload) {
+  pendingLeaderUpdates.push(updatePayload);
 }
 
 function recordVectorConfirmation(message, sender) {
@@ -297,7 +341,7 @@ async function handleUpload(req, res) {
   const filename = req.headers["filename"];
   if (!filename || String(filename).trim() === "") {
     return sendJson(res, 400, {
-      error: "Cabeçalho 'Filename' é obrigatório.",
+      error: "Cabecalho 'Filename' e obrigatorio.",
     });
   }
   try {
@@ -325,7 +369,7 @@ async function handleUpload(req, res) {
     const cid = json?.Hash ?? null;
     if (!cid) {
       return sendJson(res, 502, {
-        error: "Resposta IPFS inválida",
+        error: "Resposta IPFS invalida",
       });
     }
 
@@ -348,13 +392,13 @@ async function handleUpload(req, res) {
       createdAt: versionEntry.createdAt,
     };
 
-    let propagation = { ok: false, error: "Líder não configurado" };
+    let propagation = { ok: false, error: "Lider nao configurado" };
     if (isLeader) {
       try {
-        await publishToTopic(payload);
-        propagation = { ok: true };
+        queueLeaderUpdate(payload);
+        propagation = { ok: true, mode: "queued" };
       } catch (error) {
-        console.error("Erro ao propagar atualização para os peers:", error);
+        console.error("Erro ao propagar atualizacao para os peers:", error);
         propagation = { ok: false, error: String(error?.message || error) };
       }
     }
@@ -444,13 +488,15 @@ if (isLeader) {
   startLeaderConfirmationListener().catch((err) =>
     console.error("Erro ao iniciar listener de confirmacoes:", err)
   );
+  startLeaderHeartbeat();
+  flushLeaderBlock("startup");
 }
 
 server.listen(PORT, () => {
   console.log(
-    `Leader API em http://localhost:${PORT} ${isLeader ? "(líder)" : ""}`
+    `Leader API em http://localhost:${PORT} ${isLeader ? "(lider)" : ""}`
   );
   if (isLeader) {
-    console.log(`Propagação via pubsub tópico "${PUBSUB_TOPIC}"`);
+    console.log(`Propagacao via pubsub topico "${PUBSUB_TOPIC}"`);
   }
 });
