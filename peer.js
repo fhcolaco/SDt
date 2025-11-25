@@ -48,6 +48,7 @@ let buf = "";
 
 const vectorVersions = [];
 const pendingEmbeddings = new Map();
+const faissIndex = new Map(); // simulacao em memoria
 
 function hashVector(cids = []) {
   const h = createHash("sha256");
@@ -146,6 +147,29 @@ async function handleDocumentUpdate(payload, sender) {
   }
 }
 
+function applyCommit(payload, sender) {
+  const version = Number(payload?.vectorVersion ?? 0);
+  const vectorHash = payload?.vectorHash ? String(payload.vectorHash) : null;
+  const entry = vectorVersions.find((v) => v.version === version);
+  if (!entry) {
+    console.warn(
+      `[peer] commit recebido para versao ${version}, mas versao nao existe. De ${sender ?? "?"}`
+    );
+    return;
+  }
+  entry.confirmed = true;
+  const embeddings = pendingEmbeddings.get(version) ?? [];
+  faissIndex.set(version, {
+    embeddings,
+    vectorHash,
+    updatedAt: new Date().toISOString(),
+  });
+  pendingEmbeddings.delete(version);
+  console.log(
+    `[peer] commit aplicado para versao ${version} (hash ${vectorHash?.slice?.(0, 8) ?? "n/a"}...), index FAISS em memoria atualizado.`
+  );
+}
+
 function logConfirmation(message, sender) {
   const from = message?.peerId || sender || "peer";
   console.log(
@@ -182,6 +206,10 @@ while (true) {
       }
       if (parsed?.type === "vector-confirmation") {
         logConfirmation(parsed, obj.from);
+        continue;
+      }
+      if (parsed?.type === "vector-commit") {
+        applyCommit(parsed, obj.from);
         continue;
       }
       console.log(`[peer] [${TOPIC}] ${obj.from ?? "unknown"}: ${msg}`);

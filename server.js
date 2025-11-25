@@ -9,6 +9,8 @@ const isLeader = process.argv.includes("--leader");
 const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
 const documentVectors = [];
 const confirmationLog = new Map();
+const peerCountHint = Number(process.env.PEER_COUNT_HINT || 0);
+const peerQuorumOverride = Number(process.env.PEER_QUORUM || 0);
 let embeddingsPipelinePromise = null;
 
 function encodeTopic(topic) {
@@ -56,7 +58,7 @@ async function getEmbeddingPipeline() {
   if (!embeddingsPipelinePromise) {
     embeddingsPipelinePromise = pipeline(
       "feature-extraction",
-      "sentence-transformers/all-MiniLM-L6-v2"
+      "Xenova/all-MiniLM-L6-v2"
     );
   }
   return embeddingsPipelinePromise;
@@ -168,6 +170,61 @@ function recordVectorConfirmation(message, sender) {
       `${matches === false ? " (mismatch)" : ""}` +
       `${matches === null ? " (sem hash esperado)" : ""}`
   );
+
+  maybeCommitVersion(version);
+}
+
+function computeQuorum(entry) {
+  if (peerQuorumOverride > 0) return peerQuorumOverride;
+  const observedPeers = new Set(
+    (entry?.confirmations ?? []).map((c) => c.peerId || "peer")
+  );
+  const dynamic = observedPeers.size ? Math.floor(observedPeers.size / 2) + 1 : 1;
+  const hinted = peerCountHint > 0 ? Math.floor(peerCountHint / 2) + 1 : 1;
+  return Math.max(1, dynamic, hinted);
+}
+
+async function commitVector(version, entry) {
+  const vectorHash = hashVector(entry.cids);
+  const commitPayload = {
+    type: "vector-commit",
+    vectorVersion: version,
+    vectorHash,
+    vectorLength: entry.cids.length,
+    cids: entry.cids,
+    document: entry.metadata,
+    createdAt: entry.createdAt,
+  };
+  await publishToTopic(commitPayload);
+  entry.confirmed = true;
+  const logEntry = confirmationLog.get(version) ?? {};
+  logEntry.committed = true;
+  logEntry.committedAt = new Date().toISOString();
+  logEntry.expectedHash = logEntry.expectedHash ?? vectorHash;
+  confirmationLog.set(version, logEntry);
+  console.log(
+    `[leader] commit enviado da versao ${version} (hash ${vectorHash.slice(0, 8)}...), quorum atingido.`
+  );
+}
+
+async function maybeCommitVersion(version) {
+  const vectorEntry = documentVectors.find((v) => v.version === version);
+  if (!vectorEntry || vectorEntry.confirmed) return;
+
+  const logEntry = confirmationLog.get(version);
+  const expectedHash = hashVector(vectorEntry.cids);
+  if (!logEntry || !Array.isArray(logEntry.confirmations)) return;
+  const matching = logEntry.confirmations.filter(
+    (c) => c.hash && c.hash === expectedHash
+  );
+  const quorum = computeQuorum(logEntry);
+  if (matching.length >= quorum) {
+    try {
+      await commitVector(version, vectorEntry);
+    } catch (err) {
+      console.error("Falha ao enviar commit:", err);
+    }
+  }
 }
 
 async function startLeaderConfirmationListener() {
@@ -273,6 +330,7 @@ async function handleUpload(req, res) {
     }
 
     const versionEntry = createDocumentVectorVersion(cid, {
+      cid,
       filename: String(filename),
       size: json?.Size ? Number(json.Size) : buffer.length,
     });
