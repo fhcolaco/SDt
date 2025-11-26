@@ -136,14 +136,14 @@ function setLeader(id, term = currentTerm) {
   leaderAlive = true;
   lastHeartbeatAt = Date.now();
   if (wasDown) cancelElectionTimers();
-  if (id !== PEER_ID) {
+  const isSelfLeader = id === PEER_ID;
+  if (!isSelfLeader) {
     actingLeader = false;
     stopLeaderHeartbeats();
+    return;
   }
-  if (id === PEER_ID && !actingLeader) {
-    actingLeader = true;
-    startLeaderHeartbeats();
-  }
+  actingLeader = true;
+  startLeaderHeartbeats();
 }
 
 function detectConflict(incomingVersion) {
