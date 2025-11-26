@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
+import { spawn } from "node:child_process";
 
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 const TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
@@ -76,6 +77,7 @@ let highestCandidateId = PEER_ID;
 let electionTimer = null;
 let victoryTimer = null;
 let leaderHeartbeatTimer = null;
+let leaderServerProcess = null;
 
 function hashVector(cids = []) {
   const h = createHash("sha256");
@@ -101,6 +103,31 @@ function stopLeaderHeartbeats() {
     clearInterval(leaderHeartbeatTimer);
     leaderHeartbeatTimer = null;
   }
+}
+
+function stopLeaderServer() {
+  if (!leaderServerProcess) return;
+  console.log("[peer] parando server.js (perdemos lideranca).");
+  leaderServerProcess.kill();
+  leaderServerProcess = null;
+}
+
+function startLeaderServer() {
+  if (leaderServerProcess) return;
+  console.log("[peer] iniciando server.js em modo lider...");
+  leaderServerProcess = spawn(process.execPath, ["server.js", "--leader"], {
+    stdio: "inherit",
+    env: { ...process.env, LEADER_ID: PEER_ID },
+  });
+  leaderServerProcess.on("exit", (code, signal) => {
+    console.warn(
+      `[peer] server.js terminou (code=${code ?? "null"} signal=${signal ?? "null"}).`
+    );
+    leaderServerProcess = null;
+    if (actingLeader) {
+      console.warn("[peer] ainda sou lider mas server.js nao esta rodando.");
+    }
+  });
 }
 
 async function sendLeaderHeartbeat(reason = "heartbeat") {
@@ -140,10 +167,12 @@ function setLeader(id, term = currentTerm) {
   if (!isSelfLeader) {
     actingLeader = false;
     stopLeaderHeartbeats();
+    stopLeaderServer();
     return;
   }
   actingLeader = true;
   startLeaderHeartbeats();
+  startLeaderServer();
 }
 
 function detectConflict(incomingVersion) {
