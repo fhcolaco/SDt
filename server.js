@@ -223,7 +223,9 @@ function computeQuorum(entry) {
   const observedPeers = new Set(
     (entry?.confirmations ?? []).map((c) => c.peerId || "peer")
   );
-  const dynamic = observedPeers.size ? Math.floor(observedPeers.size / 2) + 1 : 1;
+  const dynamic = observedPeers.size
+    ? Math.floor(observedPeers.size / 2) + 1
+    : 1;
   const hinted = peerCountHint > 0 ? Math.floor(peerCountHint / 2) + 1 : 1;
   return Math.max(1, dynamic, hinted);
 }
@@ -247,7 +249,10 @@ async function commitVector(version, entry) {
   logEntry.expectedHash = logEntry.expectedHash ?? vectorHash;
   confirmationLog.set(version, logEntry);
   console.log(
-    `[leader] commit enviado da versao ${version} (hash ${vectorHash.slice(0, 8)}...), quorum atingido.`
+    `[leader] commit enviado da versao ${version} (hash ${vectorHash.slice(
+      0,
+      8
+    )}...), quorum atingido.`
   );
 }
 
@@ -472,7 +477,7 @@ const server = http.createServer(async (req, res) => {
     const { pathname } = new URL(req.url, "http://localhost");
     if (pathname === "/health" && req.method === "GET")
       return handleHealth(req, res);
-    if (pathname === "/files") return handleUpload(req, res); // aceita /files e /files/
+    if (pathname === "/files") return handleUpload(req, res);
     if (pathname === "/broadcast") return handleBroadcast(req, res);
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("Not Found");
