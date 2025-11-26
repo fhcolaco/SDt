@@ -155,24 +155,56 @@ function startLeaderHeartbeats() {
   }, LEADER_HEARTBEAT_MS);
 }
 
+function isBetterLeader(candidateId, candidateTerm) {
+  if (!candidateId) return false;
+  if (candidateTerm > currentTerm) return true;
+  if (candidateTerm < currentTerm) return false;
+  if (!currentLeaderId) return true;
+  if (candidateId === currentLeaderId) return true;
+  return candidateId > currentLeaderId;
+}
+
 function setLeader(id, term = currentTerm) {
-  if (id) currentLeaderId = id;
-  if (id) highestCandidateId = id;
-  if (term > currentTerm) currentTerm = term;
+  const candidateId = id || currentLeaderId || null;
+  const candidateTerm = Number(term ?? 0);
+  const accept = isBetterLeader(candidateId, candidateTerm);
+  if (!accept) {
+    return;
+  }
+
+  const steppingDown = actingLeader && candidateId !== PEER_ID;
+  currentLeaderId = candidateId;
+  highestCandidateId = candidateId;
+  if (candidateTerm > currentTerm) currentTerm = candidateTerm;
   const wasDown = !leaderAlive;
   leaderAlive = true;
   lastHeartbeatAt = Date.now();
   if (wasDown) cancelElectionTimers();
-  const isSelfLeader = id === PEER_ID;
+  if (steppingDown) {
+    actingLeader = false;
+    stopLeaderHeartbeats();
+    stopLeaderServer();
+    return;
+  }
+
+  const isSelfLeader = candidateId === PEER_ID;
+  const becameLeader = isSelfLeader && !actingLeader;
   if (!isSelfLeader) {
     actingLeader = false;
     stopLeaderHeartbeats();
     stopLeaderServer();
     return;
   }
+
   actingLeader = true;
+  cancelElectionTimers();
   startLeaderHeartbeats();
   startLeaderServer();
+  if (becameLeader) {
+    sendLeaderHeartbeat("assumed-leader").catch((err) =>
+      console.error("Falha ao enviar heartbeat imediato do novo lider:", err)
+    );
+  }
 }
 
 function detectConflict(incomingVersion) {
