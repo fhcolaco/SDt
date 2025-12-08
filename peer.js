@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import { spawn } from "node:child_process";
+import { pipeline } from "@xenova/transformers";
 
 const IPFS_BASE = process.env.IPFS_BASE || "http://127.0.0.1:5001";
 const TOPIC = process.env.PUBSUB_TOPIC || "SDT_Broadcast";
@@ -21,6 +22,11 @@ const VICTORY_DELAY_MS = Number(process.env.PEER_VICTORY_DELAY_MS || 1200);
 const LEADER_HEARTBEAT_MS = Number(
   process.env.PEER_LEADER_HEARTBEAT_MS || 4000
 );
+const PROMPT_CLAIM_JITTER_MS = Number(
+  process.env.PROMPT_CLAIM_JITTER_MS || 800
+);
+const PROMPT_TOP_K = Number(process.env.PROMPT_TOP_K || 3);
+const PROMPT_DOC_BYTES = Number(process.env.PROMPT_DOC_BYTES || 2048);
 
 function encodeTopic(topic) {
   const txt = String(topic ?? "");
@@ -78,6 +84,9 @@ let electionTimer = null;
 let victoryTimer = null;
 let leaderHeartbeatTimer = null;
 let leaderServerProcess = null;
+const promptClaims = new Map();
+const promptResults = new Map();
+let promptPipelinePromise = null;
 
 function hashVector(cids = []) {
   const h = createHash("sha256");
@@ -93,9 +102,116 @@ function summarizeEmbeddings(embeddings) {
   return { dimension: embeddings.length, preview };
 }
 
+async function getPromptPipeline() {
+  if (!promptPipelinePromise) {
+    promptPipelinePromise = pipeline(
+      "feature-extraction",
+      "Xenova/all-MiniLM-L6-v2"
+    );
+  }
+  return promptPipelinePromise;
+}
+
+function fallbackPromptEmbeddings(text, dimension = 64) {
+  const buf = Buffer.from(String(text ?? ""), "utf8");
+  const acc = new Array(dimension).fill(0);
+  for (let i = 0; i < buf.length; i += 1) {
+    acc[i % dimension] += buf[i];
+  }
+  const norm =
+    Math.sqrt(acc.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return acc.map((value) => value / norm);
+}
+
+async function embedPrompt(text) {
+  try {
+    const embedder = await getPromptPipeline();
+    const output = await embedder(String(text ?? ""), {
+      pooling: "mean",
+      normalize: true,
+    });
+    return Array.from(output.data);
+  } catch (err) {
+    console.error("Falha ao gerar embedding da prompt, usando fallback:", err);
+    return fallbackPromptEmbeddings(text);
+  }
+}
+
+function cosineSimilarity(a = [], b = []) {
+  const len = Math.min(a.length, b.length);
+  if (!len) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < len; i += 1) {
+    const va = Number(a[i]) || 0;
+    const vb = Number(b[i]) || 0;
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  if (!normA || !normB) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function rankFaissMatches(promptEmbedding, topK = PROMPT_TOP_K) {
+  const entries = [];
+  for (const [version, data] of faissIndex.entries()) {
+    if (!data?.embeddings || data.embeddings.length === 0) continue;
+    const similarity = cosineSimilarity(promptEmbedding, data.embeddings);
+    entries.push({
+      version,
+      similarity: Number(similarity.toFixed(4)),
+      vectorHash: data.vectorHash ?? null,
+      document: data.document ?? null,
+      updatedAt: data.updatedAt ?? null,
+    });
+  }
+  entries.sort((a, b) => Number(b.similarity) - Number(a.similarity));
+  return entries.slice(0, topK);
+}
+
+function randomPromptDelay() {
+  return Math.floor(Math.random() * PROMPT_CLAIM_JITTER_MS);
+}
+
 function randomElectionTimeout() {
   const jitter = Math.floor(Math.random() * ELECTION_TIMEOUT_JITTER_MS);
   return ELECTION_TIMEOUT_BASE_MS + jitter;
+}
+
+async function fetchDocumentPreview(cid, maxBytes = PROMPT_DOC_BYTES) {
+  if (!cid) return null;
+  try {
+    const catUrl = new URL(`${IPFS_BASE}/api/v0/cat`);
+    catUrl.searchParams.set("arg", cid);
+    const resp = await fetch(catUrl, { method: "POST" });
+    if (!resp.ok) return null;
+    const buf = await resp.arrayBuffer();
+    const slice = buf.byteLength > maxBytes ? buf.slice(0, maxBytes) : buf;
+    return new TextDecoder().decode(slice);
+  } catch (err) {
+    console.error(`Falha ao obter conteudo do CID ${cid}:`, err);
+    return null;
+  }
+}
+
+async function buildAnswerFromMatches(promptText, matches) {
+  const previews = [];
+  for (const m of matches) {
+    const cid = m?.document?.cid ?? null;
+    if (!cid) continue;
+    const text = await fetchDocumentPreview(cid, PROMPT_DOC_BYTES);
+    if (text) {
+      previews.push({ cid, text: text.trim() });
+    }
+    if (previews.length >= PROMPT_TOP_K) break;
+  }
+  if (!previews.length) return null;
+  const joined = previews
+    .map((p) => `CID ${p.cid}: ${p.text.slice(0, 400)}`)
+    .join("\n---\n");
+  return `Pergunta: ${promptText}\nFontes selecionadas:\n${joined}`;
 }
 
 function stopLeaderHeartbeats() {
@@ -305,6 +421,7 @@ function storeIncomingVersion(payload, sender) {
     cids: vector,
     confirmed: false,
     documentCid,
+    metadata: payload?.document ?? null,
     createdAt: payload?.createdAt || new Date().toISOString(),
     receivedFrom: sender,
   };
@@ -451,10 +568,12 @@ function applyCommit(payload, sender) {
   }
   entry.confirmed = true;
   const embeddings = pendingEmbeddings.get(version) ?? [];
+  const document = payload?.document ?? entry?.metadata ?? null;
   faissIndex.set(version, {
     embeddings,
     vectorHash,
     updatedAt: new Date().toISOString(),
+    document,
   });
   pendingEmbeddings.delete(version);
   console.log(
@@ -468,6 +587,150 @@ function logConfirmation(message, sender) {
     `[peer] confirmacao recebida de ${from} para versao ${message?.vectorVersion ?? "?"}` +
     `${message?.vectorHash ? ` (hash ${String(message.vectorHash).slice(0, 8)}...)` : ""}`
   );
+}
+
+async function sendPromptResponse(payload) {
+  try {
+    await publishToTopic(payload);
+  } catch (err) {
+    console.error("Falha ao publicar resposta da prompt:", err);
+  }
+  promptResults.set(payload.requestId, {
+    payload,
+    status: payload.error ? "error" : "done",
+    sentAt: new Date().toISOString(),
+  });
+  promptClaims.delete(payload.requestId);
+}
+
+async function processPromptJob(job) {
+  const promptEmbedding = await embedPrompt(job.prompt);
+  const matches = rankFaissMatches(promptEmbedding, PROMPT_TOP_K);
+  let answer = null;
+  if ((job.mode || "").toLowerCase() === "generate") {
+    answer = await buildAnswerFromMatches(job.prompt, matches);
+  }
+  const output =
+    answer ??
+    `Top ${matches.length} matches: ${matches
+      .map((m) => `${m.document?.cid ?? `v${m.version}`}:${m.similarity.toFixed(3)}`)
+      .join(", ")}`;
+  const payload = {
+    type: "prompt-response",
+    requestId: job.id,
+    token: job.token,
+    peerId: PEER_ID,
+    mode: job.mode,
+    matches,
+    output,
+  };
+  await sendPromptResponse(payload);
+  console.log(`[peer] resposta enviada para prompt ${job.id} (${job.mode}).`);
+}
+
+async function replayPromptResult(requestId) {
+  const cached = promptResults.get(requestId);
+  if (!cached?.payload) return;
+  try {
+    await publishToTopic(cached.payload);
+  } catch (err) {
+    console.error(`Falha ao reenviar resposta cacheada para ${requestId}:`, err);
+  }
+}
+
+async function sendPromptClaim(claim) {
+  const payload = {
+    type: "prompt-claim",
+    requestId: claim.id,
+    token: claim.token,
+    peerId: PEER_ID,
+    mode: claim.mode,
+  };
+  await publishToTopic(payload);
+  claim.lastClaimAt = Date.now();
+}
+
+async function handlePromptRequest(payload, sender) {
+  const requestId = payload?.requestId;
+  const token = payload?.token ? String(payload.token) : null;
+  if (!requestId || !token) return;
+  touchHeartbeat(sender ?? "leader");
+  if (promptResults.has(requestId)) {
+    await replayPromptResult(requestId);
+    return;
+  }
+  const existing = promptClaims.get(requestId);
+  if (existing && existing.token === token) {
+    const stale =
+      !existing.lastClaimAt ||
+      Date.now() - existing.lastClaimAt > Math.max(5000, PROMPT_CLAIM_JITTER_MS * 4);
+    if (stale) {
+      sendPromptClaim(existing).catch((err) =>
+        console.error("Falha ao reenviar prompt-claim:", err)
+      );
+    }
+    return;
+  }
+  const claim = {
+    id: requestId,
+    token,
+    prompt: payload?.prompt ?? "",
+    mode: payload?.mode || "faiss",
+    createdAt: payload?.createdAt || new Date().toISOString(),
+    receivedFrom: sender ?? null,
+  };
+  promptClaims.set(requestId, claim);
+  const delay = randomPromptDelay();
+  setTimeout(() => {
+    const stillPending = promptClaims.get(requestId);
+    if (!stillPending || stillPending.token !== token) return;
+    sendPromptClaim(stillPending).catch((err) =>
+      console.error("Falha ao enviar prompt-claim:", err)
+    );
+  }, delay);
+}
+
+async function handlePromptAssignment(payload, sender) {
+  const requestId = payload?.requestId;
+  const token = payload?.token ? String(payload.token) : null;
+  if (!requestId || !token) return;
+  touchHeartbeat(sender ?? "leader");
+  if (promptResults.has(requestId)) {
+    await replayPromptResult(requestId);
+    return;
+  }
+  const assignedPeer = payload?.assignedPeer;
+  if (assignedPeer && assignedPeer !== PEER_ID) {
+    promptClaims.delete(requestId);
+    return;
+  }
+  const claim = promptClaims.get(requestId);
+  if (claim && claim.token !== token) return;
+  if (assignedPeer !== PEER_ID) return;
+  const job = {
+    id: requestId,
+    token,
+    prompt: payload?.prompt ?? claim?.prompt ?? "",
+    mode: payload?.mode || claim?.mode || "faiss",
+    createdAt: payload?.createdAt || claim?.createdAt || new Date().toISOString(),
+  };
+  promptClaims.set(requestId, { ...job, assigned: true });
+  try {
+    await processPromptJob(job);
+  } catch (err) {
+    console.error(`Falha ao processar prompt ${requestId}:`, err);
+    const errorPayload = {
+      type: "prompt-response",
+      requestId,
+      token,
+      peerId: PEER_ID,
+      mode: job.mode,
+      matches: [],
+      output: null,
+      error: String(err?.message || err),
+    };
+    await sendPromptResponse(errorPayload);
+  }
 }
 
 function touchHeartbeat(source = "leader") {
@@ -512,6 +775,14 @@ while (true) {
         parsed = JSON.parse(msg);
       } catch {
         parsed = null;
+      }
+      if (parsed?.type === "prompt-request") {
+        await handlePromptRequest(parsed, obj.from);
+        continue;
+      }
+      if (parsed?.type === "prompt-claim-ack") {
+        await handlePromptAssignment(parsed, obj.from);
+        continue;
       }
       if (parsed?.type === "document-update") {
         await handleDocumentUpdate(parsed, obj.from);

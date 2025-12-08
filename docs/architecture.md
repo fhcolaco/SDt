@@ -91,3 +91,10 @@ sequenceDiagram
   Peer1->>Peer1: sincroniza estado (vetores, embeddings, indice)
   Peer2->>IPFS: leader-heartbeat periodico
 ```
+
+## Fluxo de Prompt (Fase 2)
+- **Cliente -> Leader**: `POST /prompts` com `{prompt, mode?}` (`mode`: `faiss` ou `generate`). Leader gera `id` e `token`, armazena estado e publica `prompt-request` no pubsub.
+- **Peers**: ao receber `prompt-request`, aguardam `PROMPT_CLAIM_JITTER_MS` aleatorio e publicam `prompt-claim`; o primeiro claim aceite recebe `prompt-claim-ack` do leader e processa.
+- **Processamento**: Peer gera embedding da prompt (transformer offline com fallback), consulta o indice FAISS em memoria (Map) e retorna `prompt-response` com top-K matches (similaridade, CID, metadata). Em modo `generate`, o peer busca conteudos via IPFS (`cat`) para um trecho e monta resposta simples.
+- **Entrega**: Leader escuta `prompt-response`, liga ao `id` e disponibiliza em `GET /prompts/:id`. Respostas são cacheadas para reenvio se houver pedidos repetidos.
+- **Confiabilidade**: Leader rebroadcast de `prompt-request` a cada `PROMPT_REBROADCAST_MS` enquanto pendente; abandona/limpa por `PROMPT_RETENTION_MS`. Peers reapresentam claims se stale; heartbeats continuam independentes do fluxo de prompt.

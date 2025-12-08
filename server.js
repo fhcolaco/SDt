@@ -1,5 +1,5 @@
 import http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { pipeline } from "@xenova/transformers";
 
@@ -19,8 +19,20 @@ const HEARTBEAT_INTERVAL_MS = Number(
 );
 const BLOCK_FLUSH_MS = HEARTBEAT_INTERVAL_MS;
 
+const PROMPT_REBROADCAST_MS = Number(
+  process.env.PROMPT_REBROADCAST_MS || 8000
+);
+const PROMPT_PROCESSING_TIMEOUT_MS = Number(
+  process.env.PROMPT_PROCESSING_TIMEOUT_MS || 120000
+);
+const PROMPT_RETENTION_MS = Number(
+  process.env.PROMPT_RETENTION_MS || 900000
+);
+
 const pendingLeaderUpdates = [];
+const promptRequests = new Map();
 let heartbeatTimer = null;
+let promptMaintenanceTimer = null;
 let embeddingsPipelinePromise = null;
 
 function encodeTopic(topic) {
@@ -53,6 +65,12 @@ function sendJson(res, status, obj) {
 function notFound(res) {
   res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
   res.end("Not Found");
+}
+
+async function readRequestBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks);
 }
 
 async function ipfsAlive() {
@@ -180,6 +198,103 @@ async function publishToTopic(message) {
   return payload;
 }
 
+function createPromptRequest(promptText, mode = "faiss") {
+  const id = randomUUID();
+  const token = randomBytes(12).toString("hex");
+  const now = new Date();
+  const entry = {
+    id,
+    token,
+    prompt: String(promptText || "").trim(),
+    mode: String(mode || "faiss"),
+    status: "pending",
+    assignedPeer: null,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    response: null,
+    lastBroadcastAt: 0,
+  };
+  promptRequests.set(id, entry);
+  return entry;
+}
+
+async function publishPromptRequest(entry, reason = "new") {
+  if (!entry) return;
+  const payload = {
+    type: "prompt-request",
+    requestId: entry.id,
+    token: entry.token,
+    prompt: entry.prompt,
+    mode: entry.mode,
+    createdAt: entry.createdAt,
+    reason,
+  };
+  await publishToTopic(payload);
+  entry.lastBroadcastAt = Date.now();
+}
+
+async function broadcastPromptAssignment(entry, reason = "assign") {
+  if (!entry) return;
+  const payload = {
+    type: "prompt-claim-ack",
+    requestId: entry.id,
+    token: entry.token,
+    assignedPeer: entry.assignedPeer,
+    prompt: entry.prompt,
+    mode: entry.mode,
+    createdAt: entry.createdAt,
+    reason,
+  };
+  await publishToTopic(payload);
+}
+
+function handlePromptClaim(message, sender) {
+  const id = message?.requestId;
+  const token = message?.token ? String(message.token) : null;
+  if (!id || !token) return;
+  const entry = promptRequests.get(id);
+  if (!entry || entry.token !== token) return;
+  if (entry.status === "done" || entry.status === "error") return;
+
+  const peerId = message?.peerId || sender || "peer";
+  if (!entry.assignedPeer) {
+    entry.assignedPeer = peerId;
+    entry.status = "processing";
+    entry.updatedAt = new Date().toISOString();
+    broadcastPromptAssignment(entry).catch((err) =>
+      console.error("Falha ao confirmar atribuicao de prompt:", err)
+    );
+    return;
+  }
+
+  if (entry.assignedPeer !== peerId) {
+    broadcastPromptAssignment(entry, "already-assigned").catch((err) =>
+      console.error("Falha ao reenviar atribuicao de prompt:", err)
+    );
+  }
+}
+
+function handlePromptResponse(message, sender) {
+  const id = message?.requestId;
+  const token = message?.token ? String(message.token) : null;
+  if (!id || !token) return;
+  const entry = promptRequests.get(id);
+  if (!entry || entry.token !== token) return;
+
+  const peerId = message?.peerId || sender || entry.assignedPeer || "peer";
+  entry.assignedPeer = entry.assignedPeer || peerId;
+  entry.status = message?.error ? "error" : "done";
+  entry.updatedAt = new Date().toISOString();
+  entry.response = {
+    peerId,
+    output: message?.output ?? null,
+    matches: Array.isArray(message?.matches) ? message.matches : [],
+    mode: message?.mode || entry.mode,
+    error: message?.error ? String(message.error) : null,
+    receivedAt: new Date().toISOString(),
+  };
+}
+
 function queueLeaderUpdate(updatePayload) {
   pendingLeaderUpdates.push(updatePayload);
 }
@@ -276,6 +391,42 @@ async function maybeCommitVersion(version) {
   }
 }
 
+function startPromptMaintenance() {
+  if (!isLeader) return;
+  if (promptMaintenanceTimer) clearInterval(promptMaintenanceTimer);
+  promptMaintenanceTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of promptRequests.entries()) {
+      const createdMs = Date.parse(entry.createdAt || "") || now;
+      const updatedMs = Date.parse(entry.updatedAt || "") || createdMs;
+      const age = now - createdMs;
+      const finished = entry.status === "done" || entry.status === "error";
+
+      if (finished && age > PROMPT_RETENTION_MS) {
+        promptRequests.delete(id);
+        continue;
+      }
+
+      if (!finished) {
+        const sinceBroadcast = now - (entry.lastBroadcastAt || 0);
+        if (sinceBroadcast > PROMPT_REBROADCAST_MS) {
+          publishPromptRequest(entry, "rebroadcast").catch((err) =>
+            console.error("Falha ao republicar prompt pendente:", err)
+          );
+        }
+        const inFlightTooLong =
+          entry.status === "processing" &&
+          now - updatedMs > PROMPT_PROCESSING_TIMEOUT_MS;
+        if (inFlightTooLong) {
+          entry.status = "pending";
+          entry.assignedPeer = null;
+          entry.updatedAt = new Date().toISOString();
+        }
+      }
+    }
+  }, Math.max(4000, PROMPT_REBROADCAST_MS));
+}
+
 async function startLeaderConfirmationListener() {
   const subUrl = new URL(`${IPFS_BASE}/api/v0/pubsub/sub`);
   subUrl.searchParams.set("arg", encodeTopic(PUBSUB_TOPIC));
@@ -327,6 +478,10 @@ async function startLeaderConfirmationListener() {
           }
           if (parsed?.type === "vector-confirmation") {
             recordVectorConfirmation(parsed, obj.from);
+          } else if (parsed?.type === "prompt-claim") {
+            handlePromptClaim(parsed, obj.from);
+          } else if (parsed?.type === "prompt-response") {
+            handlePromptResponse(parsed, obj.from);
           }
         } catch (err) {
           console.error("Falha ao processar mensagem do pubsub:", err);
@@ -438,6 +593,13 @@ async function handleHealth(_req, res) {
     totalVersions: documentVectors.length,
     latestSize: documentVectors.at(-1)?.cids.length ?? 0,
   };
+  const pendingPrompts = Array.from(promptRequests.values()).filter(
+    (p) => p.status !== "done" && p.status !== "error"
+  ).length;
+  body.prompts = {
+    total: promptRequests.size,
+    pending: pendingPrompts,
+  };
   return sendJson(res, 200, body);
 }
 
@@ -472,6 +634,61 @@ async function handleBroadcast(req, res) {
   }
 }
 
+async function handlePromptSubmit(req, res) {
+  if (req.method !== "POST") {
+    res.writeHead(405, { allow: "POST" });
+    return res.end();
+  }
+  const body = await readRequestBody(req);
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    parsed = null;
+  }
+  const promptText = parsed?.prompt || body.toString("utf8").trim();
+  const mode = parsed?.mode || "faiss";
+  if (!promptText || String(promptText).trim() === "") {
+    return sendJson(res, 400, { error: "Campo 'prompt' obrigatorio." });
+  }
+  if (!isLeader) {
+    return sendJson(res, 503, {
+      error: "Este processo nao e o lider ativo.",
+    });
+  }
+  const entry = createPromptRequest(promptText, mode);
+  let propagation = { ok: false };
+  try {
+    await publishPromptRequest(entry, "new");
+    propagation = { ok: true };
+  } catch (err) {
+    console.error("Falha ao publicar prompt-request:", err);
+    propagation = { ok: false, error: String(err?.message || err) };
+  }
+  return sendJson(res, 202, {
+    id: entry.id,
+    token: entry.token,
+    status: entry.status,
+    assignedPeer: entry.assignedPeer,
+    mode: entry.mode,
+    propagation,
+  });
+}
+
+async function handlePromptStatus(promptId, res) {
+  const entry = promptRequests.get(promptId);
+  if (!entry) return sendJson(res, 404, { error: "Prompt nao encontrada." });
+  return sendJson(res, 200, {
+    id: entry.id,
+    status: entry.status,
+    assignedPeer: entry.assignedPeer,
+    mode: entry.mode,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+    response: entry.response,
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const { pathname } = new URL(req.url, "http://localhost");
@@ -479,6 +696,10 @@ const server = http.createServer(async (req, res) => {
       return handleHealth(req, res);
     if (pathname === "/files") return handleUpload(req, res);
     if (pathname === "/broadcast") return handleBroadcast(req, res);
+    if (pathname === "/prompts") return handlePromptSubmit(req, res);
+    const promptMatch = pathname.match(/^\/prompts\/([^/]+)$/);
+    if (promptMatch && req.method === "GET")
+      return handlePromptStatus(promptMatch[1], res);
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("Not Found");
   } catch (e) {
@@ -494,6 +715,7 @@ if (isLeader) {
     console.error("Erro ao iniciar listener de confirmacoes:", err)
   );
   startLeaderHeartbeat();
+  startPromptMaintenance();
   flushLeaderBlock("startup");
 }
 
