@@ -54,3 +54,9 @@ classDiagram
 **Limitações**: Índice FAISS é simulado em memória (perde-se em restart), sem persistência de embeddings; sem autenticação nos endpoints; ausência de verificação cripto nas mensagens pubsub; distribuição de carga oportunista (primeiro claim) pode ser enviesada por atrasos de rede.
 
 **Melhorias Futuras**: Persistir índice/embeddings (FS ou base de dados); integrar FAISS real e shards por peer; adicionar assinatura/ACL para pubsub e API; observabilidade (métricas, tracing); política de reatribuição de prompts com prioridade e balanceamento; suportar modelos de geração locais mais robustos e streaming de respostas.
+
+Daniel Pires pv25958
+
+João Gomes pv25962 
+
+Francisco Colaço pv25013
